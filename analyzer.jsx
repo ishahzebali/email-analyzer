@@ -162,11 +162,26 @@ const parseEmail = (rawEml) => {
     const boundaryMatch = rawEml.match(/boundary=["']?([^"'\r\n]+)["']?/i);
     let parts = boundaryMatch ? rawEml.split(boundaryMatch[1]) : [rawEml];
 
+    let extractedAttachments = [];
     parts.forEach(part => {
         const splitPart = part.split(/\r?\n\r?\n/);
         if (splitPart.length < 2) return;
         const headers = splitPart[0];
         let content = splitPart.slice(1).join('\n\n').replace(/--\s*$/, '').trim();
+
+        const nameMatch = headers.match(/(?:name|filename)\s*=\s*["']?([^"'\r\n;]+)["']?/i);
+        const mimeTypeMatch = headers.match(/Content-Type:\s*([^;\r\n]+)/i);
+        const isAttachment = headers.match(/Content-Disposition:\s*attachment/i) || nameMatch;
+
+        if (isAttachment && nameMatch) {
+            extractedAttachments.push({
+                name: nameMatch[1].trim(),
+                mimeType: mimeTypeMatch ? mimeTypeMatch[1].trim() : 'application/octet-stream',
+                content: content,
+                isBase64: /Content-Transfer-Encoding:\s*base64/i.test(headers)
+            });
+            return;
+        }
 
         if (headers.match(/Content-Transfer-Encoding:\s*quoted-printable/i)) {
             content = decodeQuotedPrintable(content);
@@ -193,7 +208,10 @@ const parseEmail = (rawEml) => {
     }
 
     const fileMatches = [...rawEml.matchAll(/(?:name|filename)\s*=\s*["']?([^"'\r\n;]+)["']?/gi)];
-    data.payload.attachments = [...new Set(fileMatches.map(m => m[1].trim()))];
+    const fallbackNames = [...new Set(fileMatches.map(m => m[1].trim()))].map(name => ({
+        name, mimeType: 'application/octet-stream', content: '', isBase64: false
+    }));
+    data.payload.attachments = extractedAttachments.length > 0 ? extractedAttachments : fallbackNames;
 
     const searchArea = rawEml + "\n" + data.payload.htmlBody + "\n" + data.payload.textBody;
     const urlRegex = /(?:https?|ftp):\/\/(?:www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b(?:[-a-zA-Z0-9()@:%_\+.~#?&//=]*)/gi;
@@ -295,11 +313,66 @@ const CopyButton = ({ text, className = "" }) => {
   );
 }
 
+const SandboxModal = ({ attachment, onClose }) => {
+  if (!attachment) return null;
+
+  const isImage = attachment.mimeType.startsWith('image/');
+  const dataUri = `data:${attachment.mimeType}${attachment.isBase64 ? ';base64' : ''},${attachment.content}`;
+
+  return (
+    <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/80 backdrop-blur-sm p-4 md:p-8 animate-in fade-in">
+      <div className="bg-slate-900 border border-slate-700 rounded-2xl w-full max-w-5xl h-[85vh] flex flex-col shadow-2xl overflow-hidden relative">
+        <div className="p-4 border-b border-slate-800 flex justify-between items-center bg-slate-900/80">
+          <div className="flex items-center gap-3 overflow-hidden">
+            <ShieldCheck className="text-emerald-400 shrink-0" size={20} />
+            <div>
+              <h3 className="font-bold text-slate-200 truncate">{attachment.name}</h3>
+              <p className="text-[11px] text-slate-400 font-mono">{attachment.mimeType}</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            <a 
+              href={dataUri}
+              download={attachment.name + '.malware'}
+              className="bg-rose-900/30 hover:bg-rose-900/50 text-rose-400 border border-rose-800/50 px-3 py-1.5 rounded-lg text-xs font-bold transition-colors flex items-center gap-2"
+              title="Download safely as .malware"
+            >
+              <Download size={14} /> Safe Download
+            </a>
+            <button onClick={onClose} className="p-2 hover:bg-slate-800 rounded-lg text-slate-400 hover:text-white transition-colors">
+              <X size={20} />
+            </button>
+          </div>
+        </div>
+        
+        <div className="flex-1 bg-[#0d1117] relative p-4 flex items-center justify-center overflow-auto custom-scrollbar">
+          {isImage ? (
+            <img src={dataUri} alt={attachment.name} className="max-w-full max-h-full object-contain rounded shadow-lg" />
+          ) : (
+            <iframe 
+              src={dataUri} 
+              sandbox="" 
+              title="Attachment Sandbox" 
+              className="w-full h-full bg-white rounded shadow-lg border-0"
+            />
+          )}
+          
+          <div className="absolute bottom-4 left-1/2 -translate-x-1/2 bg-black/70 backdrop-blur-md px-4 py-2 rounded-full border border-slate-700/50 text-xs font-semibold flex items-center gap-2 shadow-xl">
+            <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
+            Sandboxed Environment Active
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
 export default function App() {
   const [isDragging, setIsDragging] = useState(false);
   const [parsedData, setParsedData] = useState(null);
   const [isDefanged, setIsDefanged] = useState(true);
   const [rawViewMode, setRawViewMode] = useState('headers');
+  const [sandboxAttachment, setSandboxAttachment] = useState(null);
   const fileInputRef = useRef(null);
 
   // Local Session History
@@ -373,7 +446,7 @@ export default function App() {
   const exportReport = () => {
     if (!parsedData) return;
     
-    const attStr = parsedData.payload.attachments.length > 0 ? parsedData.payload.attachments.join(", ") : "None Detected";
+    const attStr = parsedData.payload.attachments.length > 0 ? parsedData.payload.attachments.map(a => a.name).join(", ") : "None Detected";
     const urlStr = parsedData.payload.urls.length > 0 ? parsedData.payload.urls[0] : "None Detected";
     
     const reportContent = `=========================================================
@@ -706,9 +779,19 @@ End of Report`;
                         ) : (
                           <ul className="space-y-2">
                             {parsedData.payload.attachments.map((att, i) => (
-                              <li key={i} className="text-sm bg-slate-900/80 px-3 py-2.5 rounded-md border border-slate-700/80 flex items-center gap-3 font-mono text-slate-200 shadow-sm">
-                                <span className="w-1.5 h-1.5 rounded-full bg-orange-500 shrink-0 shadow-[0_0_8px_rgba(249,115,22,0.8)]"></span> 
-                                <span className="truncate">{att}</span>
+                              <li key={i} className="text-sm bg-slate-900/80 px-3 py-2.5 rounded-md border border-slate-700/80 flex items-center justify-between font-mono text-slate-200 shadow-sm">
+                                <div className="flex items-center gap-3 overflow-hidden">
+                                  <span className="w-1.5 h-1.5 rounded-full bg-orange-500 shrink-0 shadow-[0_0_8px_rgba(249,115,22,0.8)]"></span> 
+                                  <span className="truncate">{att.name}</span>
+                                </div>
+                                {att.content && (
+                                  <button 
+                                    onClick={() => setSandboxAttachment(att)}
+                                    className="bg-blue-600/20 hover:bg-blue-600/40 text-blue-400 border border-blue-500/30 px-2.5 py-1 rounded text-xs font-sans font-bold flex items-center gap-1.5 transition-colors ml-3 shrink-0"
+                                  >
+                                    <Search size={12}/> Sandbox
+                                  </button>
+                                )}
                               </li>
                             ))}
                           </ul>
@@ -1004,6 +1087,12 @@ End of Report`;
             )}
           </div>
         </main>
+        {sandboxAttachment && (
+          <SandboxModal 
+            attachment={sandboxAttachment} 
+            onClose={() => setSandboxAttachment(null)} 
+          />
+        )}
       </div>
     </div>
   );

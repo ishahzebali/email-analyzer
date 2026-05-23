@@ -13,7 +13,8 @@ It allows analysts to drag-and-drop raw `.eml` or `.txt` email files and instant
 *   🔒 **Zero-Trust Privacy:** 100% client-side parsing. Your malicious `.eml` files never leave your browser, ensuring strict adherence to data privacy and OPSEC.
 *   🛤️ **Advanced Routing Hop Tracing:** Reconstructs the email's chronological path by parsing `Received:` headers, exposing the true Originating IP and internal server hops.
 *   🛡️ **Spoofing Detection:** Automatically analyzes SPF, DKIM, and DMARC authentication headers, and flags mismatches between the `From` address and the `Return-Path`.
-*   📦 **Payload Extraction & Defanging:** Safely extracts attachment names and web URLs. Features a 1-click URL defanger (e.g., `hxxp://malicious[.]com`) and integration with URL2PNG for safe screenshotting.
+*   📦 **Payload Extraction & Defanging:** Safely extracts full Base64 attachment payloads and web URLs. Features a 1-click URL defanger (e.g., `hxxp://malicious[.]com`) and integration with URL2PNG for safe screenshotting.
+*   🧪 **Safe Attachment Sandbox:** Instantly preview suspicious PDFs, images, and other attachments in a strictly isolated HTML5 sandbox (`iframe sandbox=""`). Includes a 1-click "Safe Download" that prevents accidental local execution by forcing a `.malware` extension.
 *   🖼️ **Sandboxed Visual Preview:** Renders the email's HTML body inside a strictly restricted `iframe sandbox`, blocking JavaScript execution, popups, and tracking pixels while allowing the analyst to see the social engineering lure.
 *   📝 **Interactive Investigation Report:** Built-in 15-point Analyst Playbook. Analysts can answer manual investigation questions (Reverse DNS, Threat Type, Remediation) and export a formatted `.txt` brief ready for ticketing systems (Jira, ServiceNow, etc.).
 
