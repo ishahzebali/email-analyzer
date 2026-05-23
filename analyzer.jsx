@@ -76,9 +76,12 @@ const parseEmail = (rawEml) => {
     const headerSplit = rawEml.split(/\r?\n\r?\n/);
     data.headers = headerSplit[0] || 'No headers found';
 
+    const headerBlock = rawEml.split(/\r?\n\r?\n/)[0] || rawEml;
+    const unfoldedHeaders = headerBlock.replace(/\r?\n[ \t]+/g, ' ');
+
     const extractHeader = (regex) => {
-      if (!rawEml || typeof rawEml !== 'string') return 'Unknown';
-      const match = rawEml.match(regex);
+      if (!unfoldedHeaders || typeof unfoldedHeaders !== 'string') return 'Unknown';
+      const match = unfoldedHeaders.match(regex);
       if (match && match.length > 1 && typeof match[1] === 'string') {
         return match[1].trim();
       }
@@ -110,7 +113,7 @@ const parseEmail = (rawEml) => {
       } catch (e) { /* ignore date parse errors */ }
     }
 
-    const receivedHeaders = [...rawEml.matchAll(/^Received:\s*(.+?(?=\n\S|\n\n))/gims)];
+    const receivedHeaders = [...unfoldedHeaders.matchAll(/^Received:\s*(.+)$/gim)];
     data.network.hopCount = receivedHeaders.length;
     
     data.network.routingPath = receivedHeaders.map(h => {
@@ -140,7 +143,7 @@ const parseEmail = (rawEml) => {
       }
     }
 
-    const authResults = extractHeader(/^Authentication-Results:\s*(.+?(?=\n\S|\n\n))/ims);
+    const authResults = extractHeader(/^Authentication-Results:\s*(.+)$/im);
     if (authResults !== 'Unknown') {
       const spfMatch = authResults.match(/spf=(pass|fail|neutral|softfail|none)/i);
       if (spfMatch && spfMatch[1]) data.auth.spf = spfMatch[1].toLowerCase();
@@ -190,7 +193,7 @@ const parseEmail = (rawEml) => {
         } else if (headers.match(/Content-Transfer-Encoding:\s*base64/i)) {
             try {
                if(headers.match(/Content-Type:\s*text/i)) { 
-                   content = decodeURIComponent(escape(atob(content.replace(/\s/g, ''))));
+                   content = new TextDecoder('utf-8').decode(Uint8Array.from(atob(content.replace(/\s/g, '')), c => c.charCodeAt(0)));
                }
             } catch(e){}
         }
@@ -316,6 +319,8 @@ const CopyButton = ({ text, className = "" }) => {
 }
 
 const SandboxModal = ({ attachment, onClose }) => {
+  const [renderConfirmed, setRenderConfirmed] = useState(false);
+  
   if (!attachment) return null;
 
   const isImage = attachment.mimeType.startsWith('image/');
@@ -350,13 +355,25 @@ const SandboxModal = ({ attachment, onClose }) => {
         <div className="flex-1 bg-[#0d1117] relative p-4 flex items-center justify-center overflow-auto custom-scrollbar">
           {isImage ? (
             <img src={dataUri} alt={attachment.name} className="max-w-full max-h-full object-contain rounded shadow-lg" />
-          ) : (
+          ) : renderConfirmed ? (
             <iframe 
               src={dataUri} 
               sandbox="" 
               title="Attachment Sandbox" 
               className="w-full h-full bg-white rounded shadow-lg border-0"
             />
+          ) : (
+            <div className="flex flex-col items-center justify-center text-center max-w-md bg-slate-900 border border-rose-900/50 p-8 rounded-xl shadow-2xl">
+              <AlertTriangle className="text-rose-500 w-16 h-16 mb-4" />
+              <h4 className="text-lg font-bold text-slate-200 mb-2">Potentially Unsafe Content</h4>
+              <p className="text-sm text-slate-400 mb-6">You are attempting to render a complex document format ({attachment.mimeType}). Even inside a sandbox, browser vulnerabilities can occasionally be exploited.</p>
+              <button 
+                onClick={() => setRenderConfirmed(true)} 
+                className="bg-rose-600 hover:bg-rose-500 text-white font-bold py-2.5 px-6 rounded-lg transition-colors shadow-lg shadow-rose-900/50"
+              >
+                Render Document Anyway
+              </button>
+            </div>
           )}
           
           <div className="absolute bottom-4 left-1/2 -translate-x-1/2 bg-black/70 backdrop-blur-md px-4 py-2 rounded-full border border-slate-700/50 text-xs font-semibold flex items-center gap-2 shadow-xl">
@@ -805,8 +822,8 @@ export default function App() {
                                   <span>{displayUrl}</span>
                                   <div className="flex items-center gap-2 self-end mt-1 opacity-80 group-hover:opacity-100 transition-opacity">
                                     <CopyButton text={displayUrl} />
-                                    <a href={`https://www.url2png.com/?url=${encodeURIComponent(url)}`} target="_blank" rel="noreferrer" className="text-[11px] font-sans bg-indigo-500/15 hover:bg-indigo-500/30 text-indigo-300 px-2.5 py-1.5 rounded-md border border-indigo-500/40 transition-colors flex items-center font-semibold shadow-sm">
-                                      <ExternalLink size={12} className="mr-1"/> URL2PNG
+                                    <a href={`https://urlscan.io/search/#${encodeURIComponent(url)}`} target="_blank" rel="noreferrer" className="text-[11px] font-sans bg-indigo-500/15 hover:bg-indigo-500/30 text-indigo-300 px-2.5 py-1.5 rounded-md border border-indigo-500/40 transition-colors flex items-center font-semibold shadow-sm">
+                                      <ExternalLink size={12} className="mr-1"/> urlscan.io
                                     </a>
                                   </div>
                                 </li>
@@ -923,7 +940,7 @@ export default function App() {
                         <div className="bg-slate-900/60 p-3.5 rounded-lg border border-slate-700/60 shadow-sm relative">
                           <span className="absolute -top-2.5 left-3 bg-slate-800 px-2 text-[10px] font-bold text-blue-400 uppercase tracking-wide border border-slate-700 rounded-sm">10. Attached File Name</span>
                           <div className="text-sm text-slate-200 font-mono truncate mt-1">
-                            {parsedData.payload.attachments.length > 0 ? parsedData.payload.attachments.join(", ") : "None Detected"}
+                            {parsedData.payload.attachments.length > 0 ? parsedData.payload.attachments.map(a => a.name).join(", ") : "None Detected"}
                           </div>
                         </div>
 
