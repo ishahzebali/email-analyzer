@@ -4,6 +4,8 @@ import {
   Server, Search, AlertTriangle, CheckCircle, Info, Mail, Target, 
   ExternalLink, Clock, Menu, X, Trash2, Code, Download, FileJson
 } from 'lucide-react';
+import { toPng } from 'html-to-image';
+import { jsPDF } from 'jspdf';
 
 const DEMO_EML = `Delivered-To: victim@company.com
 Received: by 10.220.100.150 with SMTP id t14csp123456;
@@ -373,6 +375,7 @@ export default function App() {
   const [isDefanged, setIsDefanged] = useState(true);
   const [rawViewMode, setRawViewMode] = useState('headers');
   const [sandboxAttachment, setSandboxAttachment] = useState(null);
+  const [isExporting, setIsExporting] = useState(false);
   const fileInputRef = useRef(null);
 
   // Local Session History
@@ -443,53 +446,32 @@ export default function App() {
     setCtfAnswers(prev => ({ ...prev, [field]: value }));
   };
 
-  const exportReport = () => {
+  const exportReport = async () => {
     if (!parsedData) return;
     
-    const attStr = parsedData.payload.attachments.length > 0 ? parsedData.payload.attachments.map(a => a.name).join(", ") : "None Detected";
-    const urlStr = parsedData.payload.urls.length > 0 ? parsedData.payload.urls[0] : "None Detected";
-    
-    const reportContent = `=========================================================
-SOC L1 INCIDENT INVESTIGATION REPORT
-=========================================================
-Generated: ${new Date().toLocaleString()}
-File Analyzed: ${history.find(h => h.id === activeHistoryId)?.fileName || 'Unknown'}
-
---- PHASE 1: HEADER & ROUTING ANALYSIS ---
-1. Primary Recipient: ${parsedData.basic.to}
-${parsedData.basic.cc !== 'Unknown' ? `   CC: ${parsedData.basic.cc}` : ''}
-2. Sender (From): ${parsedData.basic.from}
-3. Return-Path: ${parsedData.network.returnPath}
-   (Spoof Check: ${parsedData.basic.from.includes(parsedData.network.returnPath.replace(/[<>]/g, '')) ? 'MATCH' : 'MISMATCH / SUSPICIOUS'})
-4. Subject: ${parsedData.basic.subject}
-5. Date/Time Sent: ${parsedData.basic.utcDate}
-6. Message-ID: ${parsedData.basic.messageId}
-
---- PHASE 2: INFRASTRUCTURE & PAYLOAD ANALYSIS ---
-7. Originating IP: ${parsedData.network.originatingIp}
-8. Resolved Host (Reverse DNS): ${ctfAnswers.reverseDns || '[Not Provided]'}
-9. Auth Status: SPF [${parsedData.auth.spf.toUpperCase()}] | DKIM [${parsedData.auth.dkim.toUpperCase()}] | DMARC [${parsedData.auth.dmarc.toUpperCase()}]
-10. Attached File Name(s): ${attStr}
-11. Primary Malicious URL: ${urlStr}
-12. URL Hosting Service: ${ctfAnswers.hostingService || '[Not Provided]'}
-13. Webpage Heading Text: ${ctfAnswers.headingText || '[Not Provided]'}
-
---- PHASE 3: ANALYST ASSESSMENT ---
-14. Threat Classification: ${ctfAnswers.threatType || '[Not Classified]'}
-15. Recommended Remediation: ${ctfAnswers.remediation || '[No Recommendation Given]'}
-
-=========================================================
-End of Report`;
-
-    const blob = new Blob([reportContent], { type: 'text/plain' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `SOC_Report_${Date.now()}.txt`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+    setIsExporting(true);
+    try {
+      const element = document.getElementById('soc-report-content');
+      if (!element) return;
+      
+      const imgData = await toPng(element, { 
+        pixelRatio: 2,
+        backgroundColor: '#0f172a',
+      });
+      
+      const pdf = new jsPDF('p', 'mm', 'a4');
+      const imgProps = pdf.getImageProperties(imgData);
+      
+      const pdfWidth = pdf.internal.pageSize.getWidth();
+      const pdfHeight = (imgProps.height * pdfWidth) / imgProps.width;
+      
+      pdf.addImage(imgData, 'PNG', 0, 0, pdfWidth, pdfHeight);
+      pdf.save(`SOC_Report_${Date.now()}.pdf`);
+    } catch (err) {
+      console.error("Failed to generate PDF:", err);
+    } finally {
+      setIsExporting(false);
+    }
   };
 
   const onDrop = useCallback((e) => {
@@ -838,14 +820,14 @@ End of Report`;
                 </div>
 
                 {/* CTF Report Section */}
-                <div className="lg:col-span-2">
+                <div className="lg:col-span-2" id="soc-report-content">
                   <SectionCard 
                     title="SOC L1 Investigation Report" 
                     icon={Target} 
                     className="border-blue-800/50 bg-blue-950/10 shadow-[0_0_30px_rgba(30,58,138,0.1)] relative overflow-hidden"
                     action={
-                      <button onClick={exportReport} className="flex items-center gap-2 bg-blue-600 hover:bg-blue-500 text-white text-xs font-bold px-3 py-1.5 rounded shadow-lg transition-colors">
-                        <Download size={14} /> Export Report
+                      <button onClick={exportReport} disabled={isExporting} className="flex items-center gap-2 bg-blue-600 hover:bg-blue-500 text-white text-xs font-bold px-3 py-1.5 rounded shadow-lg transition-colors disabled:opacity-50" data-html2canvas-ignore>
+                        <Download size={14} /> {isExporting ? 'Exporting...' : 'Export PDF'}
                       </button>
                     }
                   >
