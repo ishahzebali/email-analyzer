@@ -247,11 +247,17 @@ const parseEmail = (rawEml) => {
 // Each rule returns null or { id, name, tactic, url, confidence, evidence }
 // Confidence: high | medium | low
 // ================================================================
-const SUSPICIOUS_TLDS = ['.zip', '.mov', '.top', '.xyz', '.click', '.link', '.tk', '.ml', '.ga', '.cf'];
-const URGENCY_KEYWORDS = ['urgent', 'immediately', 'suspended', 'verify', 'expire', 'action required', 'unauthorized', 'restricted'];
+const SUSPICIOUS_TLDS = ['.zip', '.mov', '.top', '.xyz', '.click', '.link', '.tk', '.ml', '.ga', '.cf', '.icu', '.rest', '.country', '.support', '.fit'];
+const URGENCY_KEYWORDS = ['urgent', 'immediately', 'suspended', 'verify', 'expire', 'expir', 'action required', 'unauthorized', 'restricted', 'limited', 'within 24', 'within 48', 'final notice', 'last chance', 'overdue', 'failure to'];
 const SUSPICIOUS_ATTACH_EXT = /\.(exe|scr|js|jse|vbs|vbe|wsf|hta|lnk|bat|cmd|ps1|jar|iso|img|zip|rar|7z|docm|xlsm|pptm)$/i;
 const PHISH_ATTACH_EXT = /\.(pdf|docx?|xlsx?|html?|htm)$/i;
-const FREE_HOSTING_PROVIDERS = /(firebaseapp\.com|web\.app|netlify\.app|vercel\.app|github\.io|glitch\.me|repl\.co|pages\.dev|workers\.dev|000webhostapp\.com|weebly\.com|wixsite\.com|blogspot\.com)/i;
+const FREE_HOSTING_PROVIDERS = /(firebaseapp\.com|web\.app|netlify\.app|vercel\.app|github\.io|glitch\.me|repl\.co|pages\.dev|workers\.dev|000webhostapp\.com|weebly\.com|wixsite\.com|blogspot\.com|r2\.dev|onrender\.com)/i;
+const URL_SHORTENERS = /(bit\.ly|tinyurl\.com|goo\.gl|t\.co|ow\.ly|is\.gd|buff\.ly|rebrand\.ly|cutt\.ly|short\.io|tiny\.cc|shorturl\.at)/i;
+
+// Auth helpers
+const isAuthBad = (status) => ['fail', 'softfail'].includes(status);
+const isAuthMissing = (status) => ['neutral', 'none'].includes(status);
+const isAuthPass = (status) => status === 'pass';
 
 const detectMitreTechniques = (data) => {
   const techniques = [];
@@ -261,19 +267,28 @@ const detectMitreTechniques = (data) => {
   const replyTo = (data.basic.replyTo || '').toLowerCase();
   const hasUrls = data.payload.urls.length > 0;
   const hasAttachments = data.payload.attachments.length > 0;
-  const authFails = ['fail', 'softfail'].includes(data.auth.spf) || ['fail'].includes(data.auth.dkim) || ['fail'].includes(data.auth.dmarc);
+
+  const authBad = isAuthBad(data.auth.spf) || isAuthBad(data.auth.dkim) || isAuthBad(data.auth.dmarc);
+  const authNotPassing = !isAuthPass(data.auth.spf) && !isAuthPass(data.auth.dkim) && !isAuthPass(data.auth.dmarc);
+  const matchedUrgency = URGENCY_KEYWORDS.filter(k => subject.includes(k) || body.includes(k));
 
   // T1566.002 - Spearphishing Link
-  if (hasUrls && (authFails || URGENCY_KEYWORDS.some(k => subject.includes(k) || body.includes(k)))) {
+  // Fire on ANY external URL; confidence varies by corroborating evidence
+  if (hasUrls) {
     const evidence = [];
-    if (authFails) evidence.push('Authentication failures (SPF/DKIM/DMARC)');
-    const matchedKeywords = URGENCY_KEYWORDS.filter(k => subject.includes(k) || body.includes(k));
-    if (matchedKeywords.length) evidence.push(`Urgency keywords: ${matchedKeywords.slice(0,3).join(', ')}`);
+    let confidence = 'low';
+    if (authBad) { evidence.push('Authentication failures (SPF/DKIM/DMARC)'); confidence = 'high'; }
+    else if (authNotPassing) { evidence.push('No passing authentication (SPF/DKIM/DMARC absent or neutral)'); confidence = 'medium'; }
+    if (matchedUrgency.length) {
+      evidence.push(`Urgency keywords: ${matchedUrgency.slice(0,3).join(', ')}`);
+      if (confidence === 'low') confidence = 'medium';
+      else if (confidence === 'medium') confidence = 'high';
+    }
     evidence.push(`${data.payload.urls.length} URL(s) extracted`);
     techniques.push({
       id: 'T1566.002', name: 'Spearphishing Link', tactic: 'Initial Access',
       url: 'https://attack.mitre.org/techniques/T1566/002/',
-      confidence: authFails ? 'high' : 'medium', evidence
+      confidence, evidence
     });
   }
 
@@ -281,40 +296,51 @@ const detectMitreTechniques = (data) => {
   if (hasAttachments) {
     const suspiciousFiles = data.payload.attachments.filter(a => SUSPICIOUS_ATTACH_EXT.test(a.name));
     const phishFiles = data.payload.attachments.filter(a => PHISH_ATTACH_EXT.test(a.name));
-    if (suspiciousFiles.length || (phishFiles.length && authFails)) {
+    if (suspiciousFiles.length || phishFiles.length) {
       const evidence = [];
-      if (suspiciousFiles.length) evidence.push(`High-risk attachment(s): ${suspiciousFiles.map(a => a.name).join(', ')}`);
-      if (phishFiles.length) evidence.push(`Document attachment(s): ${phishFiles.map(a => a.name).join(', ')}`);
-      if (authFails) evidence.push('Authentication failures present');
+      let confidence = 'low';
+      if (suspiciousFiles.length) {
+        evidence.push(`High-risk attachment(s): ${suspiciousFiles.map(a => a.name).join(', ')}`);
+        confidence = 'high';
+      }
+      if (phishFiles.length) {
+        evidence.push(`Document attachment(s): ${phishFiles.map(a => a.name).join(', ')}`);
+        if (confidence === 'low') confidence = authBad || matchedUrgency.length ? 'medium' : 'low';
+      }
+      if (authBad) evidence.push('Authentication failures present');
+      if (matchedUrgency.length) evidence.push('Combined with urgency language');
       techniques.push({
         id: 'T1566.001', name: 'Spearphishing Attachment', tactic: 'Initial Access',
         url: 'https://attack.mitre.org/techniques/T1566/001/',
-        confidence: suspiciousFiles.length ? 'high' : 'medium', evidence
+        confidence, evidence
       });
     }
   }
 
-  // T1656 - Impersonation (brand spoofing in display name)
-  const brands = ['paypal', 'microsoft', 'amazon', 'apple', 'google', 'netflix', 'dhl', 'fedex', 'ups', 'irs', 'bank', 'office365', 'docusign', 'adobe', 'linkedin'];
+  // T1656 - Impersonation (brand spoofing in display name OR subject)
+  const brands = ['paypal', 'microsoft', 'amazon', 'apple', 'google', 'netflix', 'dhl', 'fedex', 'ups', 'irs', 'bank', 'office365', 'office 365', 'docusign', 'adobe', 'linkedin', 'meta', 'facebook', 'instagram', 'whatsapp', 'chase', 'wells fargo', 'hsbc', 'barclays'];
   const fromDisplayMatch = data.basic.from.match(/^"?([^"<]+)"?\s*</);
   const fromDisplay = fromDisplayMatch ? fromDisplayMatch[1].toLowerCase().trim() : fromAddr;
   const fromDomain = (fromAddr.match(/@([^\s>]+)/) || [])[1] || '';
-  const impersonatedBrand = brands.find(b => 
-    (fromDisplay.includes(b) || subject.includes(b)) && !fromDomain.endsWith(`${b}.com`)
-  );
+  const impersonatedBrand = brands.find(b => {
+    const inSender = fromDisplay.includes(b) || subject.includes(b);
+    const brandRoot = b.replace(/\s+/g, '');
+    const domainMatchesBrand = fromDomain.includes(brandRoot);
+    return inSender && !domainMatchesBrand;
+  });
   if (impersonatedBrand) {
     techniques.push({
       id: 'T1656', name: 'Impersonation', tactic: 'Defense Evasion',
       url: 'https://attack.mitre.org/techniques/T1656/',
       confidence: 'high', 
       evidence: [
-        `Display name claims "${impersonatedBrand}" but sender domain is "${fromDomain}"`,
+        `Sender claims "${impersonatedBrand}" but envelope domain is "${fromDomain || 'unknown'}"`,
         'Likely brand spoofing for social engineering'
       ]
     });
   }
 
-  // T1534 - Internal Spearphishing / Reply-To mismatch
+  // T1534 - Reply-To / From mismatch
   if (data.basic.replyTo !== 'Unknown' && replyTo) {
     const replyDomain = (replyTo.match(/@([^\s>]+)/) || [])[1] || '';
     if (replyDomain && fromDomain && replyDomain !== fromDomain) {
@@ -330,7 +356,7 @@ const detectMitreTechniques = (data) => {
     }
   }
 
-  // T1071.001 - Application Layer Protocol: Web (free hosting C2/staging)
+  // T1071.001 - Web Protocols (free hosting C2/staging)
   const freeHostingHit = data.payload.urls.find(u => FREE_HOSTING_PROVIDERS.test(u));
   if (freeHostingHit) {
     const provider = freeHostingHit.match(FREE_HOSTING_PROVIDERS)[1];
@@ -345,8 +371,8 @@ const detectMitreTechniques = (data) => {
     });
   }
 
-  // T1598.003 - Spearphishing for Information (credential harvesting indicator)
-  const credKeywords = ['login', 'verify', 'sign in', 'password', 'account', 'confirm identity', 'update payment'];
+  // T1598.003 - Spearphishing for Information (credential harvesting)
+  const credKeywords = ['login', 'verify', 'sign in', 'sign-in', 'password', 'account', 'confirm identity', 'update payment', 'credentials', 'authenticate', 'unlock account'];
   const matchedCred = credKeywords.filter(k => body.includes(k));
   if (hasUrls && matchedCred.length >= 2) {
     techniques.push({
@@ -360,46 +386,134 @@ const detectMitreTechniques = (data) => {
     });
   }
 
-  // T1036 - Masquerading (suspicious TLD)
+  // T1036 - Masquerading (suspicious TLD or URL shortener)
   const suspiciousTldHit = data.payload.urls.find(u => SUSPICIOUS_TLDS.some(tld => {
     try { return new URL(u).hostname.endsWith(tld); } catch { return false; }
   }));
-  if (suspiciousTldHit) {
-    const hostname = new URL(suspiciousTldHit).hostname;
+  const shortenerHit = data.payload.urls.find(u => URL_SHORTENERS.test(u));
+  if (suspiciousTldHit || shortenerHit) {
+    const evidence = [];
+    if (suspiciousTldHit) {
+      try { evidence.push(`Suspicious TLD in URL: ${new URL(suspiciousTldHit).hostname}`); } catch {}
+    }
+    if (shortenerHit) evidence.push(`URL shortener detected: ${shortenerHit.match(URL_SHORTENERS)[1]}`);
+    evidence.push('Commonly used to obscure final destination');
     techniques.push({
       id: 'T1036', name: 'Masquerading', tactic: 'Defense Evasion',
       url: 'https://attack.mitre.org/techniques/T1036/',
-      confidence: 'low',
-      evidence: [
-        `Suspicious TLD in URL: ${hostname}`,
-        'TLDs frequently abused for low-cost phishing infrastructure'
-      ]
+      confidence: shortenerHit ? 'medium' : 'low',
+      evidence
     });
   }
 
   return techniques;
 };
 
+// Detect base risk indicators that always contribute to score
+// (independent of full MITRE rule firings — these are atomic suspicious traits)
+const detectBaseIndicators = (data) => {
+  const indicators = [];
+  const subject = (data.basic.subject || '').toLowerCase();
+  const body = ((data.payload.htmlBody || '') + ' ' + (data.payload.textBody || '')).toLowerCase();
+  const fromAddr = (data.basic.from || '').toLowerCase();
+  const fromDomain = (fromAddr.match(/@([^\s>]+)/) || [])[1] || '';
+  const returnPath = (data.network.returnPath || '').toLowerCase();
+  const returnDomain = (returnPath.match(/@([^\s>]+)/) || [])[1] || '';
+
+  // Return-Path / From mismatch
+  if (returnDomain && fromDomain && returnDomain !== fromDomain) {
+    indicators.push({ label: 'Return-Path domain differs from From', weight: 12 });
+  }
+
+  // X-Mailer telling on itself
+  const xMailer = (data.network.xMailer || '').toLowerCase();
+  if (xMailer && /(php\s*mailer|bulk|mass|sendgrid trial|smtp\.js)/i.test(xMailer)) {
+    indicators.push({ label: `Suspicious X-Mailer: ${data.network.xMailer}`, weight: 10 });
+  }
+
+  // Urgency language alone (even without URLs)
+  const matchedUrgency = URGENCY_KEYWORDS.filter(k => subject.includes(k) || body.includes(k));
+  if (matchedUrgency.length >= 2) {
+    indicators.push({ label: `Multiple urgency cues (${matchedUrgency.length})`, weight: 8 });
+  } else if (matchedUrgency.length === 1) {
+    indicators.push({ label: `Urgency cue: "${matchedUrgency[0]}"`, weight: 4 });
+  }
+
+  // ALL CAPS subject (>50% caps and >10 chars)
+  const subjRaw = data.basic.subject || '';
+  if (subjRaw.length > 10) {
+    const letters = subjRaw.replace(/[^a-zA-Z]/g, '');
+    if (letters.length > 5) {
+      const caps = (subjRaw.match(/[A-Z]/g) || []).length;
+      if (caps / letters.length > 0.5) {
+        indicators.push({ label: 'Subject uses excessive capitalization', weight: 3 });
+      }
+    }
+  }
+
+  // No DMARC policy / SPF none
+  if (data.auth.dmarc === 'none' || data.auth.dmarc === 'neutral') {
+    indicators.push({ label: 'No DMARC enforcement', weight: 5 });
+  }
+  if (data.auth.spf === 'none') {
+    indicators.push({ label: 'No SPF record published', weight: 5 });
+  }
+
+  // Originating IP outside common provider ranges (heuristic: not first received)
+  // Cheap signal: if originatingIp exists and hopCount > 0, flag if it's the only hop
+  if (data.network.originatingIp !== 'Unknown' && data.network.hopCount <= 2) {
+    indicators.push({ label: 'Short delivery chain (possible direct-to-MX)', weight: 4 });
+  }
+
+  // Sender domain looks like brand+keyword (e.g. billing-paypal-secure.com)
+  if (fromDomain) {
+    const brandsForLookalike = ['paypal', 'microsoft', 'amazon', 'apple', 'google', 'netflix', 'dhl', 'fedex', 'docusign', 'office365', 'chase'];
+    const lookalike = brandsForLookalike.find(b => 
+      fromDomain.includes(b) && !fromDomain.startsWith(`${b}.`) && fromDomain !== `${b}.com`
+    );
+    if (lookalike) {
+      indicators.push({ label: `Sender domain contains brand "${lookalike}" but is not legitimate`, weight: 15 });
+    }
+    // Excessive hyphens / numbers in subdomain
+    if ((fromDomain.match(/-/g) || []).length >= 3) {
+      indicators.push({ label: 'Sender domain has excessive hyphens', weight: 5 });
+    }
+  }
+
+  return indicators;
+};
+
 // ================================================================
 // THREAT SCORE (0-100)
 // ================================================================
-const calculateThreatScore = (data, techniques) => {
+const calculateThreatScore = (data, techniques, baseIndicators = []) => {
   let score = 0;
   const factors = [];
 
-  if (data.auth.spf === 'fail') { score += 20; factors.push('SPF fail (+20)'); }
+  // Authentication posture
+  if (data.auth.spf === 'fail') { score += 18; factors.push('SPF fail (+18)'); }
   else if (data.auth.spf === 'softfail') { score += 10; factors.push('SPF softfail (+10)'); }
-  if (data.auth.dkim === 'fail') { score += 15; factors.push('DKIM fail (+15)'); }
-  if (data.auth.dmarc === 'fail') { score += 20; factors.push('DMARC fail (+20)'); }
-  if (data.auth.dmarc === 'none') { score += 5; factors.push('No DMARC policy (+5)'); }
+  else if (data.auth.spf === 'none') { score += 4; factors.push('No SPF record (+4)'); }
 
+  if (data.auth.dkim === 'fail') { score += 15; factors.push('DKIM fail (+15)'); }
+  else if (data.auth.dkim === 'none' || data.auth.dkim === 'neutral') { score += 3; factors.push('DKIM not signed (+3)'); }
+
+  if (data.auth.dmarc === 'fail') { score += 18; factors.push('DMARC fail (+18)'); }
+  else if (data.auth.dmarc === 'none') { score += 4; factors.push('No DMARC policy (+4)'); }
+
+  // MITRE techniques
   techniques.forEach(t => {
-    const pts = t.confidence === 'high' ? 15 : t.confidence === 'medium' ? 8 : 3;
+    const pts = t.confidence === 'high' ? 18 : t.confidence === 'medium' ? 10 : 5;
     score += pts;
     factors.push(`${t.id} ${t.confidence} (+${pts})`);
   });
 
-  // Cap and floor
+  // Base indicators
+  baseIndicators.forEach(ind => {
+    score += ind.weight;
+    factors.push(`${ind.label} (+${ind.weight})`);
+  });
+
   score = Math.min(100, Math.max(0, score));
   return { score, factors };
 };
@@ -854,9 +968,11 @@ export default function App() {
   const intel = useMemo(() => {
     if (!parsedData) return null;
     const techniques = detectMitreTechniques(parsedData);
-    const threat = calculateThreatScore(parsedData, techniques);
+    const baseIndicators = detectBaseIndicators(parsedData);
+    const threat = calculateThreatScore(parsedData, techniques, baseIndicators);
     return {
       techniques,
+      baseIndicators,
       threat,
       exports: {
         kql: generateKQL(parsedData),
@@ -1133,13 +1249,30 @@ export default function App() {
                       className="border-rose-900/40 bg-gradient-to-br from-slate-800/60 to-rose-950/10"
                     >
                       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-                        {/* Score */}
-                        <div className="lg:col-span-1 bg-slate-900/60 p-5 rounded-lg border border-slate-700/60 shadow-inner">
+                        {/* Score and Base Indicators */}
+                        <div className="lg:col-span-1 bg-slate-900/60 p-5 rounded-lg border border-slate-700/60 shadow-inner flex flex-col">
                           <div className="flex items-center gap-2 mb-3">
                             <Activity size={14} className="text-rose-400" />
                             <h4 className="text-[11px] font-bold text-slate-400 uppercase tracking-wider">Threat Score</h4>
                           </div>
                           <ThreatScore score={intel.threat.score} factors={intel.threat.factors} />
+
+                          {intel.baseIndicators && intel.baseIndicators.length > 0 && (
+                            <div className="mt-5 pt-4 border-t border-slate-700/50 flex-1">
+                              <div className="flex items-center gap-2 mb-3">
+                                <AlertTriangle size={14} className="text-orange-400" />
+                                <h4 className="text-[11px] font-bold text-slate-400 uppercase tracking-wider">Suspicious Indicators</h4>
+                              </div>
+                              <ul className="space-y-2">
+                                {intel.baseIndicators.map((ind, i) => (
+                                  <li key={i} className="text-[11px] bg-slate-800/80 p-2 rounded border border-slate-700/50 text-slate-300 flex justify-between items-start gap-2 shadow-sm">
+                                    <span className="flex-1">{ind.label}</span>
+                                    <span className="text-rose-400 font-bold shrink-0">+{ind.weight}</span>
+                                  </li>
+                                ))}
+                              </ul>
+                            </div>
+                          )}
                         </div>
 
                         {/* MITRE Techniques */}
