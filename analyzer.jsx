@@ -1,8 +1,9 @@
-import React, { useState, useCallback, useRef, useEffect } from 'react';
+import React, { useState, useCallback, useRef, useEffect, useMemo } from 'react';
 import { 
   UploadCloud, ShieldAlert, ShieldCheck, FileText, Link as LinkIcon, 
   Server, Search, AlertTriangle, CheckCircle, Info, Mail, Target, 
-  ExternalLink, Clock, Menu, X, Trash2, Code, Download, FileJson
+  ExternalLink, Clock, Menu, X, Trash2, Code, Download, FileJson,
+  Crosshair, Database, Activity, Zap
 } from 'lucide-react';
 import { toPng } from 'html-to-image';
 import { jsPDF } from 'jspdf';
@@ -62,12 +63,15 @@ Y29kZT4+CnN0cmVhbQp4nDP... (fake base64 data)
 ------=_NextPart_000--
 `;
 
+// ================================================================
+// EMAIL PARSER
+// ================================================================
 const parseEmail = (rawEml) => {
   const data = {
     basic: { to: 'Unknown', from: 'Unknown', subject: 'No Subject', date: 'Unknown', utcDate: 'Unknown', messageId: 'Unknown', replyTo: 'Unknown', cc: 'Unknown', contentType: 'Unknown', priority: 'Normal' },
     auth: { spf: 'neutral', dkim: 'neutral', dmarc: 'neutral' },
     network: { originatingIp: 'Unknown', returnPath: 'Unknown', xMailer: 'Unknown', hopCount: 0, routingPath: [] },
-    payload: { urls: [], attachments: [], htmlBody: '', textBody: '' },
+    payload: { urls: [], attachments: [], htmlBody: '', textBody: '', domains: [] },
     raw: rawEml,
     headers: ''
   };
@@ -103,14 +107,13 @@ const parseEmail = (rawEml) => {
     const priorityMatch = extractHeader(/^(?:X-Priority|Importance):\s*(.+)$/im);
     if (priorityMatch !== 'Unknown') data.basic.priority = priorityMatch;
 
-    // Normalize Date to UTC
     if (data.basic.date !== 'Unknown') {
       try {
         const dateObj = new Date(data.basic.date);
         if (!isNaN(dateObj)) {
           data.basic.utcDate = dateObj.toUTCString();
         }
-      } catch (e) { /* ignore date parse errors */ }
+      } catch (e) { /* ignore */ }
     }
 
     const receivedHeaders = [...unfoldedHeaders.matchAll(/^Received:\s*(.+)$/gim)];
@@ -127,7 +130,7 @@ const parseEmail = (rawEml) => {
         by: byMatch ? byMatch[1] : 'Unknown',
         ip: ipMatch ? ipMatch[1] : 'None'
       };
-    }).reverse(); // Order from oldest to newest
+    }).reverse();
 
     if (receivedHeaders.length > 0) {
       for (let i = receivedHeaders.length - 1; i >= 0; i--) {
@@ -227,6 +230,11 @@ const parseEmail = (rawEml) => {
     );
     data.payload.urls = uniqueUrls;
 
+    // Extract unique domains from URLs for IOC export
+    data.payload.domains = [...new Set(uniqueUrls.map(url => {
+        try { return new URL(url).hostname; } catch (e) { return null; }
+    }).filter(Boolean))];
+
   } catch (err) {
     console.error("Error parsing EML:", err);
   }
@@ -234,6 +242,348 @@ const parseEmail = (rawEml) => {
   return data;
 };
 
+// ================================================================
+// MITRE ATT&CK DETECTION ENGINE
+// Each rule returns null or { id, name, tactic, url, confidence, evidence }
+// Confidence: high | medium | low
+// ================================================================
+const SUSPICIOUS_TLDS = ['.zip', '.mov', '.top', '.xyz', '.click', '.link', '.tk', '.ml', '.ga', '.cf'];
+const URGENCY_KEYWORDS = ['urgent', 'immediately', 'suspended', 'verify', 'expire', 'action required', 'unauthorized', 'restricted'];
+const SUSPICIOUS_ATTACH_EXT = /\.(exe|scr|js|jse|vbs|vbe|wsf|hta|lnk|bat|cmd|ps1|jar|iso|img|zip|rar|7z|docm|xlsm|pptm)$/i;
+const PHISH_ATTACH_EXT = /\.(pdf|docx?|xlsx?|html?|htm)$/i;
+const FREE_HOSTING_PROVIDERS = /(firebaseapp\.com|web\.app|netlify\.app|vercel\.app|github\.io|glitch\.me|repl\.co|pages\.dev|workers\.dev|000webhostapp\.com|weebly\.com|wixsite\.com|blogspot\.com)/i;
+
+const detectMitreTechniques = (data) => {
+  const techniques = [];
+  const subject = (data.basic.subject || '').toLowerCase();
+  const body = ((data.payload.htmlBody || '') + ' ' + (data.payload.textBody || '')).toLowerCase();
+  const fromAddr = (data.basic.from || '').toLowerCase();
+  const replyTo = (data.basic.replyTo || '').toLowerCase();
+  const hasUrls = data.payload.urls.length > 0;
+  const hasAttachments = data.payload.attachments.length > 0;
+  const authFails = ['fail', 'softfail'].includes(data.auth.spf) || ['fail'].includes(data.auth.dkim) || ['fail'].includes(data.auth.dmarc);
+
+  // T1566.002 - Spearphishing Link
+  if (hasUrls && (authFails || URGENCY_KEYWORDS.some(k => subject.includes(k) || body.includes(k)))) {
+    const evidence = [];
+    if (authFails) evidence.push('Authentication failures (SPF/DKIM/DMARC)');
+    const matchedKeywords = URGENCY_KEYWORDS.filter(k => subject.includes(k) || body.includes(k));
+    if (matchedKeywords.length) evidence.push(`Urgency keywords: ${matchedKeywords.slice(0,3).join(', ')}`);
+    evidence.push(`${data.payload.urls.length} URL(s) extracted`);
+    techniques.push({
+      id: 'T1566.002', name: 'Spearphishing Link', tactic: 'Initial Access',
+      url: 'https://attack.mitre.org/techniques/T1566/002/',
+      confidence: authFails ? 'high' : 'medium', evidence
+    });
+  }
+
+  // T1566.001 - Spearphishing Attachment
+  if (hasAttachments) {
+    const suspiciousFiles = data.payload.attachments.filter(a => SUSPICIOUS_ATTACH_EXT.test(a.name));
+    const phishFiles = data.payload.attachments.filter(a => PHISH_ATTACH_EXT.test(a.name));
+    if (suspiciousFiles.length || (phishFiles.length && authFails)) {
+      const evidence = [];
+      if (suspiciousFiles.length) evidence.push(`High-risk attachment(s): ${suspiciousFiles.map(a => a.name).join(', ')}`);
+      if (phishFiles.length) evidence.push(`Document attachment(s): ${phishFiles.map(a => a.name).join(', ')}`);
+      if (authFails) evidence.push('Authentication failures present');
+      techniques.push({
+        id: 'T1566.001', name: 'Spearphishing Attachment', tactic: 'Initial Access',
+        url: 'https://attack.mitre.org/techniques/T1566/001/',
+        confidence: suspiciousFiles.length ? 'high' : 'medium', evidence
+      });
+    }
+  }
+
+  // T1656 - Impersonation (brand spoofing in display name)
+  const brands = ['paypal', 'microsoft', 'amazon', 'apple', 'google', 'netflix', 'dhl', 'fedex', 'ups', 'irs', 'bank', 'office365', 'docusign', 'adobe', 'linkedin'];
+  const fromDisplayMatch = data.basic.from.match(/^"?([^"<]+)"?\s*</);
+  const fromDisplay = fromDisplayMatch ? fromDisplayMatch[1].toLowerCase().trim() : fromAddr;
+  const fromDomain = (fromAddr.match(/@([^\s>]+)/) || [])[1] || '';
+  const impersonatedBrand = brands.find(b => 
+    (fromDisplay.includes(b) || subject.includes(b)) && !fromDomain.endsWith(`${b}.com`)
+  );
+  if (impersonatedBrand) {
+    techniques.push({
+      id: 'T1656', name: 'Impersonation', tactic: 'Defense Evasion',
+      url: 'https://attack.mitre.org/techniques/T1656/',
+      confidence: 'high', 
+      evidence: [
+        `Display name claims "${impersonatedBrand}" but sender domain is "${fromDomain}"`,
+        'Likely brand spoofing for social engineering'
+      ]
+    });
+  }
+
+  // T1534 - Internal Spearphishing / Reply-To mismatch
+  if (data.basic.replyTo !== 'Unknown' && replyTo) {
+    const replyDomain = (replyTo.match(/@([^\s>]+)/) || [])[1] || '';
+    if (replyDomain && fromDomain && replyDomain !== fromDomain) {
+      techniques.push({
+        id: 'T1534', name: 'Internal Spearphishing', tactic: 'Lateral Movement',
+        url: 'https://attack.mitre.org/techniques/T1534/',
+        confidence: 'medium',
+        evidence: [
+          `Reply-To domain (${replyDomain}) differs from From domain (${fromDomain})`,
+          'Response redirection indicates infrastructure separation'
+        ]
+      });
+    }
+  }
+
+  // T1071.001 - Application Layer Protocol: Web (free hosting C2/staging)
+  const freeHostingHit = data.payload.urls.find(u => FREE_HOSTING_PROVIDERS.test(u));
+  if (freeHostingHit) {
+    const provider = freeHostingHit.match(FREE_HOSTING_PROVIDERS)[1];
+    techniques.push({
+      id: 'T1071.001', name: 'Web Protocols', tactic: 'Command and Control',
+      url: 'https://attack.mitre.org/techniques/T1071/001/',
+      confidence: 'medium',
+      evidence: [
+        `URL hosted on free/abusable platform: ${provider}`,
+        'Free hosting commonly used to stage credential-harvest pages'
+      ]
+    });
+  }
+
+  // T1598.003 - Spearphishing for Information (credential harvesting indicator)
+  const credKeywords = ['login', 'verify', 'sign in', 'password', 'account', 'confirm identity', 'update payment'];
+  const matchedCred = credKeywords.filter(k => body.includes(k));
+  if (hasUrls && matchedCred.length >= 2) {
+    techniques.push({
+      id: 'T1598.003', name: 'Spearphishing for Information', tactic: 'Reconnaissance',
+      url: 'https://attack.mitre.org/techniques/T1598/003/',
+      confidence: 'medium',
+      evidence: [
+        `Credential-solicitation language: ${matchedCred.slice(0,4).join(', ')}`,
+        'Combined with embedded link(s)'
+      ]
+    });
+  }
+
+  // T1036 - Masquerading (suspicious TLD)
+  const suspiciousTldHit = data.payload.urls.find(u => SUSPICIOUS_TLDS.some(tld => {
+    try { return new URL(u).hostname.endsWith(tld); } catch { return false; }
+  }));
+  if (suspiciousTldHit) {
+    const hostname = new URL(suspiciousTldHit).hostname;
+    techniques.push({
+      id: 'T1036', name: 'Masquerading', tactic: 'Defense Evasion',
+      url: 'https://attack.mitre.org/techniques/T1036/',
+      confidence: 'low',
+      evidence: [
+        `Suspicious TLD in URL: ${hostname}`,
+        'TLDs frequently abused for low-cost phishing infrastructure'
+      ]
+    });
+  }
+
+  return techniques;
+};
+
+// ================================================================
+// THREAT SCORE (0-100)
+// ================================================================
+const calculateThreatScore = (data, techniques) => {
+  let score = 0;
+  const factors = [];
+
+  if (data.auth.spf === 'fail') { score += 20; factors.push('SPF fail (+20)'); }
+  else if (data.auth.spf === 'softfail') { score += 10; factors.push('SPF softfail (+10)'); }
+  if (data.auth.dkim === 'fail') { score += 15; factors.push('DKIM fail (+15)'); }
+  if (data.auth.dmarc === 'fail') { score += 20; factors.push('DMARC fail (+20)'); }
+  if (data.auth.dmarc === 'none') { score += 5; factors.push('No DMARC policy (+5)'); }
+
+  techniques.forEach(t => {
+    const pts = t.confidence === 'high' ? 15 : t.confidence === 'medium' ? 8 : 3;
+    score += pts;
+    factors.push(`${t.id} ${t.confidence} (+${pts})`);
+  });
+
+  // Cap and floor
+  score = Math.min(100, Math.max(0, score));
+  return { score, factors };
+};
+
+// ================================================================
+// IOC EXPORT GENERATORS
+// ================================================================
+const generateCSV = (data) => {
+  const rows = [['type', 'value', 'context', 'source']];
+  if (data.network.originatingIp !== 'Unknown') {
+    rows.push(['ipv4-addr', data.network.originatingIp, 'Originating mail server', 'Received header']);
+  }
+  data.payload.domains.forEach(d => rows.push(['domain-name', d, 'Extracted from URL', 'Email body']));
+  data.payload.urls.forEach(u => rows.push(['url', u, 'Embedded link', 'Email body']));
+  data.payload.attachments.forEach(a => rows.push(['file-name', a.name, a.mimeType, 'Email attachment']));
+  const fromDomain = ((data.basic.from || '').match(/@([^\s>]+)/) || [])[1];
+  if (fromDomain) rows.push(['domain-name', fromDomain, 'Sender domain', 'From header']);
+  if (data.basic.from !== 'Unknown') {
+    const emailMatch = data.basic.from.match(/<([^>]+)>/) || data.basic.from.match(/([\w.+-]+@[\w.-]+)/);
+    if (emailMatch) rows.push(['email-addr', emailMatch[1], 'Sender address', 'From header']);
+  }
+  return rows.map(r => r.map(c => `"${String(c).replace(/"/g, '""')}"`).join(',')).join('\n');
+};
+
+const generateSTIX = (data) => {
+  const now = new Date().toISOString();
+  const objects = [];
+  const bundleId = `bundle--${crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2)}`;
+  
+  const makeIndicator = (pattern, name) => ({
+    type: 'indicator',
+    spec_version: '2.1',
+    id: `indicator--${crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2)}`,
+    created: now, modified: now,
+    name, pattern, pattern_type: 'stix', valid_from: now,
+    labels: ['malicious-activity']
+  });
+
+  if (data.network.originatingIp !== 'Unknown') {
+    objects.push(makeIndicator(`[ipv4-addr:value = '${data.network.originatingIp}']`, `Originating IP: ${data.network.originatingIp}`));
+  }
+  data.payload.domains.forEach(d => {
+    objects.push(makeIndicator(`[domain-name:value = '${d}']`, `Phishing domain: ${d}`));
+  });
+  data.payload.urls.forEach(u => {
+    const escaped = u.replace(/'/g, "\\'");
+    objects.push(makeIndicator(`[url:value = '${escaped}']`, `Phishing URL: ${u.slice(0, 80)}`));
+  });
+  data.payload.attachments.forEach(a => {
+    objects.push(makeIndicator(`[file:name = '${a.name.replace(/'/g, "\\'")}']`, `Attachment: ${a.name}`));
+  });
+
+  return JSON.stringify({
+    type: 'bundle',
+    id: bundleId,
+    objects
+  }, null, 2);
+};
+
+// KQL: Microsoft Defender XDR / Sentinel
+// Defender for Office 365 tables: EmailEvents, EmailUrlInfo, EmailAttachmentInfo
+// For generic Sentinel, swap: EmailEvents -> CommonSecurityLog, SenderFromAddress -> SourceUserName, etc.
+const generateKQL = (data) => {
+  const urls = data.payload.urls.map(u => `"${u}"`).join(', ');
+  const domains = data.payload.domains.map(d => `"${d}"`).join(', ');
+  const ip = data.network.originatingIp;
+  const fromAddr = ((data.basic.from || '').match(/<([^>]+)>/) || [])[1] || data.basic.from;
+  const attachNames = data.payload.attachments.map(a => `"${a.name}"`).join(', ');
+
+  return `// =====================================================================
+// SOC Auto-Triage — Microsoft Defender XDR / Sentinel Hunt Queries
+// Schema: Microsoft 365 Defender Advanced Hunting (EmailEvents, EmailUrlInfo, EmailAttachmentInfo, DeviceNetworkEvents)
+// 
+// For generic SIEMs, substitute as follows:
+//   EmailEvents              -> your mail-flow log table
+//   SenderFromAddress        -> sender / smtp.mailfrom field
+//   RecipientEmailAddress    -> recipient field
+//   Url                      -> url / dest_url
+//   DeviceNetworkEvents      -> proxy or firewall outbound table
+//   RemoteIP                 -> destination IP field
+// =====================================================================
+
+// [1] Find other emails from the same sender (last 30d)
+EmailEvents
+| where Timestamp > ago(30d)
+| where SenderFromAddress =~ "${fromAddr}"
+| project Timestamp, NetworkMessageId, SenderFromAddress, RecipientEmailAddress, Subject, DeliveryAction, ThreatTypes
+| order by Timestamp desc
+
+// [2] Find users who clicked any of the malicious URLs
+EmailUrlInfo
+| where Url in~ (${urls || '""'})
+| join kind=inner (EmailEvents | where Timestamp > ago(30d)) on NetworkMessageId
+| project Timestamp, RecipientEmailAddress, Url, Subject, SenderFromAddress
+| order by Timestamp desc
+
+// [3] Endpoint traffic to phishing domains (post-delivery click detection)
+DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| where RemoteUrl has_any (${domains || '""'})
+| project Timestamp, DeviceName, InitiatingProcessAccountName, InitiatingProcessFileName, RemoteUrl, RemoteIP, ActionType
+| order by Timestamp desc
+
+// [4] Inbound mail from the originating IP (sender infrastructure reuse)
+EmailEvents
+| where Timestamp > ago(30d)
+| where SenderIPv4 == "${ip}"
+| summarize EmailCount=count(), UniqueSenders=dcount(SenderFromAddress), 
+            Recipients=make_set(RecipientEmailAddress, 100), 
+            Subjects=make_set(Subject, 50) by SenderIPv4
+| extend ThreatLevel = iff(UniqueSenders > 5, "HIGH - Likely compromised infrastructure", "MEDIUM")
+
+// [5] Attachments with matching filenames across tenant
+EmailAttachmentInfo
+| where Timestamp > ago(30d)
+| where FileName in~ (${attachNames || '""'})
+| join kind=inner EmailEvents on NetworkMessageId
+| project Timestamp, FileName, SHA256, FileType, SenderFromAddress, RecipientEmailAddress, Subject
+| order by Timestamp desc
+
+// [6] Detonate the IOCs — Threat Intelligence correlation
+// (Requires ThreatIntelligenceIndicator table from Sentinel TI connectors)
+ThreatIntelligenceIndicator
+| where ExpirationDateTime > now() and Active == true
+| where NetworkIP == "${ip}"
+   or NetworkDomain in~ (${domains || '""'})
+   or Url in~ (${urls || '""'})
+| project IndicatorId, Description, ThreatType, ConfidenceScore, NetworkIP, NetworkDomain, Url
+`;
+};
+
+// SPL: Splunk
+const generateSPL = (data) => {
+  const urlList = data.payload.urls.map(u => `"${u}"`).join(' OR url=');
+  const domainList = data.payload.domains.map(d => `"${d}"`).join(' OR ');
+  const ip = data.network.originatingIp;
+  const fromAddr = ((data.basic.from || '').match(/<([^>]+)>/) || [])[1] || data.basic.from;
+  const attachList = data.payload.attachments.map(a => `"${a.name}"`).join(' OR filename=');
+
+  return `# =====================================================================
+# SOC Auto-Triage — Splunk Hunt Queries (SPL)
+# Default sourcetypes assume Splunk for O365 / Splunk_TA_microsoft-cloudservices
+# Substitute as needed:
+#   sourcetype=ms:o365:management       -> your mail-flow sourcetype
+#   sourcetype=ms:defender:atp:alerts   -> your EDR sourcetype
+#   sourcetype=stream:http              -> your proxy/web sourcetype
+# =====================================================================
+
+# [1] Other emails from the same sender (last 30d)
+search earliest=-30d sourcetype=ms:o365:management sender_address="${fromAddr}"
+| table _time, network_message_id, sender_address, recipient_address, subject, delivery_action
+| sort -_time
+
+# [2] Mail containing any of the malicious URLs
+search earliest=-30d sourcetype=ms:o365:management (url=${urlList || '""'})
+| table _time, recipient_address, subject, sender_address, url
+| sort -_time
+
+# [3] Proxy / web traffic to phishing domains (clicked links)
+search earliest=-7d sourcetype=stream:http (${domainList ? 'site=' + domainList : 'site=""'})
+| stats count by src_ip, user, site, url
+| sort -count
+
+# [4] Other inbound mail from originating IP
+search earliest=-30d sourcetype=ms:o365:management src_ip="${ip}"
+| stats count as email_count dc(sender_address) as unique_senders values(recipient_address) as recipients values(subject) as subjects by src_ip
+| eval threat_level=if(unique_senders>5, "HIGH - Likely compromised infrastructure", "MEDIUM")
+
+# [5] Attachments with matching filenames across estate
+search earliest=-30d sourcetype=ms:o365:management (filename=${attachList || '""'})
+| table _time, filename, file_hash, sender_address, recipient_address, subject
+| sort -_time
+
+# [6] Endpoint process activity tied to the IOCs (Sysmon/EDR)
+search earliest=-7d sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" 
+       (DestinationIp="${ip}" OR DestinationHostname IN (${data.payload.domains.map(d => `"${d}"`).join(', ') || '""'}))
+| table _time, host, user, Image, DestinationIp, DestinationHostname
+| sort -_time
+`;
+};
+
+// ================================================================
+// UI COMPONENTS
+// ================================================================
 const Badge = ({ status, text }) => {
   let colors = "bg-slate-700/50 text-slate-300 border-slate-600";
   let Icon = Info;
@@ -283,11 +633,7 @@ const CopyButton = ({ text, className = "" }) => {
       document.body.appendChild(textArea);
       textArea.focus();
       textArea.select();
-      try {
-        document.execCommand('copy');
-      } catch (err) {
-        console.error('Fallback copy failed', err);
-      }
+      try { document.execCommand('copy'); } catch (err) { console.error('Fallback copy failed', err); }
       document.body.removeChild(textArea);
     };
 
@@ -316,7 +662,104 @@ const CopyButton = ({ text, className = "" }) => {
       {copied ? 'Copied!' : 'Copy'}
     </button>
   );
-}
+};
+
+const downloadFile = (content, filename, mimeType = 'text/plain') => {
+  const blob = new Blob([content], { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+};
+
+// MITRE Technique Card
+const MitreCard = ({ technique }) => {
+  const confColors = {
+    high: 'bg-rose-900/30 text-rose-300 border-rose-800/50',
+    medium: 'bg-amber-900/30 text-amber-300 border-amber-800/50',
+    low: 'bg-slate-700/50 text-slate-300 border-slate-600'
+  };
+  
+  return (
+    <div className="bg-slate-900/60 border border-slate-700/60 rounded-lg p-4 hover:border-blue-500/50 transition-all shadow-sm">
+      <div className="flex items-start justify-between gap-3 mb-2">
+        <div className="flex-1 min-w-0">
+          <a 
+            href={technique.url} target="_blank" rel="noreferrer" 
+            className="text-blue-400 hover:text-blue-300 font-bold font-mono text-sm flex items-center gap-1.5"
+          >
+            {technique.id} <ExternalLink size={11} />
+          </a>
+          <div className="text-slate-100 font-semibold text-sm mt-0.5">{technique.name}</div>
+          <div className="text-[10px] text-slate-500 font-medium uppercase tracking-wider mt-0.5">{technique.tactic}</div>
+        </div>
+        <span className={`text-[10px] font-bold uppercase tracking-wider px-2 py-1 rounded border ${confColors[technique.confidence]}`}>
+          {technique.confidence}
+        </span>
+      </div>
+      <ul className="mt-3 space-y-1 border-t border-slate-700/50 pt-2">
+        {technique.evidence.map((ev, i) => (
+          <li key={i} className="text-[11px] text-slate-400 flex items-start gap-1.5 leading-snug">
+            <span className="text-blue-500 mt-1">•</span>
+            <span>{ev}</span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+};
+
+// Threat Score Gauge
+const ThreatScore = ({ score, factors }) => {
+  const level = score >= 70 ? 'critical' : score >= 40 ? 'high' : score >= 20 ? 'medium' : 'low';
+  const levelMeta = {
+    critical: { color: 'text-rose-400', bg: 'from-rose-600 to-rose-400', ring: 'stroke-rose-500', label: 'CRITICAL' },
+    high: { color: 'text-orange-400', bg: 'from-orange-600 to-orange-400', ring: 'stroke-orange-500', label: 'HIGH' },
+    medium: { color: 'text-amber-400', bg: 'from-amber-600 to-amber-400', ring: 'stroke-amber-500', label: 'MEDIUM' },
+    low: { color: 'text-emerald-400', bg: 'from-emerald-600 to-emerald-400', ring: 'stroke-emerald-500', label: 'LOW' }
+  };
+  const meta = levelMeta[level];
+  const circumference = 2 * Math.PI * 42;
+  const offset = circumference - (score / 100) * circumference;
+
+  return (
+    <div className="flex items-center gap-5">
+      <div className="relative w-28 h-28 shrink-0">
+        <svg className="w-full h-full -rotate-90" viewBox="0 0 100 100">
+          <circle cx="50" cy="50" r="42" stroke="currentColor" className="text-slate-700" strokeWidth="8" fill="none" />
+          <circle 
+            cx="50" cy="50" r="42" 
+            className={meta.ring}
+            strokeWidth="8" fill="none" strokeLinecap="round"
+            strokeDasharray={circumference}
+            strokeDashoffset={offset}
+            style={{ transition: 'stroke-dashoffset 0.8s ease-out' }}
+          />
+        </svg>
+        <div className="absolute inset-0 flex flex-col items-center justify-center">
+          <span className={`text-2xl font-bold ${meta.color}`}>{score}</span>
+          <span className="text-[9px] font-bold text-slate-500 uppercase tracking-wider">/ 100</span>
+        </div>
+      </div>
+      <div className="flex-1 min-w-0">
+        <div className={`text-xs font-bold uppercase tracking-wider mb-1 ${meta.color}`}>{meta.label} Risk</div>
+        <div className="text-[11px] text-slate-400 leading-snug mb-2">Heuristic score derived from auth posture + detected ATT&CK techniques.</div>
+        {factors.length > 0 && (
+          <details className="text-[10px] text-slate-500">
+            <summary className="cursor-pointer hover:text-slate-300 font-semibold">Scoring breakdown</summary>
+            <ul className="mt-1.5 space-y-0.5 pl-2">
+              {factors.map((f, i) => <li key={i} className="font-mono">{f}</li>)}
+            </ul>
+          </details>
+        )}
+      </div>
+    </div>
+  );
+};
 
 const SandboxModal = ({ attachment, onClose }) => {
   const [renderConfirmed, setRenderConfirmed] = useState(false);
@@ -386,6 +829,9 @@ const SandboxModal = ({ attachment, onClose }) => {
   );
 };
 
+// ================================================================
+// MAIN APP
+// ================================================================
 export default function App() {
   const [isDragging, setIsDragging] = useState(false);
   const [parsedData, setParsedData] = useState(null);
@@ -393,21 +839,33 @@ export default function App() {
   const [rawViewMode, setRawViewMode] = useState('headers');
   const [sandboxAttachment, setSandboxAttachment] = useState(null);
   const [isExporting, setIsExporting] = useState(false);
+  const [iocTab, setIocTab] = useState('kql');
   const fileInputRef = useRef(null);
 
-  // Local Session History
   const [history, setHistory] = useState([]);
   const [activeHistoryId, setActiveHistoryId] = useState(null);
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
 
-  // CTF Input State
   const [ctfAnswers, setCtfAnswers] = useState({
-    reverseDns: '',
-    hostingService: '',
-    headingText: '',
-    threatType: '',
-    remediation: ''
+    reverseDns: '', hostingService: '', headingText: '', threatType: '', remediation: ''
   });
+
+  // Memoized intelligence layer
+  const intel = useMemo(() => {
+    if (!parsedData) return null;
+    const techniques = detectMitreTechniques(parsedData);
+    const threat = calculateThreatScore(parsedData, techniques);
+    return {
+      techniques,
+      threat,
+      exports: {
+        kql: generateKQL(parsedData),
+        spl: generateSPL(parsedData),
+        csv: generateCSV(parsedData),
+        stix: generateSTIX(parsedData)
+      }
+    };
+  }, [parsedData]);
 
   useEffect(() => {
     const handleResize = () => {
@@ -428,7 +886,7 @@ export default function App() {
       fileName: fileName,
       subject: result.basic.subject,
       data: result,
-      ctf: { reverseDns: '', hostingService: '', headingText: '', threatType: '', remediation: '' } // fresh CTF state
+      ctf: { reverseDns: '', hostingService: '', headingText: '', threatType: '', remediation: '' }
     };
 
     setParsedData(result);
@@ -440,12 +898,9 @@ export default function App() {
   };
 
   const loadFromHistory = (record) => {
-    // Save current CTF state to the outgoing history item
     setHistory(prev => prev.map(item => 
       item.id === activeHistoryId ? { ...item, ctf: ctfAnswers } : item
     ));
-
-    // Load the new record
     setParsedData(record.data);
     setActiveHistoryId(record.id);
     setCtfAnswers(record.ctf || { reverseDns: '', hostingService: '', headingText: '', threatType: '', remediation: '' });
@@ -465,23 +920,15 @@ export default function App() {
 
   const exportReport = async () => {
     if (!parsedData) return;
-    
     setIsExporting(true);
     try {
       const element = document.getElementById('soc-report-content');
       if (!element) return;
-      
-      const imgData = await toPng(element, { 
-        pixelRatio: 2,
-        backgroundColor: '#0f172a',
-      });
-      
+      const imgData = await toPng(element, { pixelRatio: 2, backgroundColor: '#0f172a' });
       const pdf = new jsPDF('p', 'mm', 'a4');
       const imgProps = pdf.getImageProperties(imgData);
-      
       const pdfWidth = pdf.internal.pageSize.getWidth();
       const pdfHeight = (imgProps.height * pdfWidth) / imgProps.width;
-      
       pdf.addImage(imgData, 'PNG', 0, 0, pdfWidth, pdfHeight);
       pdf.save(`SOC_Report_${Date.now()}.pdf`);
     } catch (err) {
@@ -511,6 +958,14 @@ export default function App() {
     }
   };
 
+  const currentExport = intel?.exports[iocTab] || '';
+  const exportFilename = {
+    kql: `hunt_queries_${Date.now()}.kql`,
+    spl: `hunt_queries_${Date.now()}.spl`,
+    csv: `iocs_${Date.now()}.csv`,
+    stix: `iocs_${Date.now()}.json`
+  }[iocTab];
+
   return (
     <div className="flex h-screen w-full bg-[#0f172a] text-slate-200 font-sans overflow-hidden selection:bg-blue-500/30">
       
@@ -530,7 +985,7 @@ export default function App() {
         />
       )}
 
-      {/* Sidebar: Session History */}
+      {/* Sidebar */}
       <div className={`fixed lg:relative inset-y-0 left-0 z-50 transform transition-all duration-300 ease-in-out ${isSidebarOpen ? 'translate-x-0 w-80' : '-translate-x-full lg:translate-x-0 lg:w-0'} bg-slate-900/95 backdrop-blur-xl border-r border-slate-800 flex flex-col shrink-0 shadow-[4px_0_24px_rgba(0,0,0,0.5)] lg:shadow-none`}>
         <div className={`w-80 h-full flex flex-col absolute lg:relative right-0 ${!isSidebarOpen ? 'lg:hidden' : ''}`}>
           <div className="p-5 border-b border-slate-800/80 flex justify-between items-center bg-slate-900/50">
@@ -584,10 +1039,10 @@ export default function App() {
         </div>
       </div>
 
-      {/* Main Content Area */}
+      {/* Main Area */}
       <div className="flex-1 flex flex-col min-w-0 bg-[radial-gradient(ellipse_at_top_right,_var(--tw-gradient-stops))] from-slate-900 via-[#0f172a] to-slate-950">
         
-        {/* Header Bar */}
+        {/* Header */}
         <header className="px-6 py-4 border-b border-slate-800/80 glass-panel flex items-center justify-between sticky top-0 z-30 shadow-sm">
           <div className="flex items-center gap-4">
             {!isSidebarOpen && (
@@ -607,27 +1062,27 @@ export default function App() {
                   <span className="flex h-2 w-2 relative mr-2">
                     <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
                     <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
-                </span>
-                Local Session Secure
+                  </span>
+                  Local Session Secure
+                </div>
               </div>
             </div>
           </div>
-        </div>
-        
-        <div className="flex items-center gap-3">
-          {parsedData && (
-            <button 
-              onClick={() => { setParsedData(null); setActiveHistoryId(null); setIsDefanged(true); }} 
-              className="bg-slate-800 hover:bg-slate-700 text-slate-200 px-4 py-2 rounded-md text-sm font-semibold transition-all border border-slate-700 hover:border-slate-500 shadow-sm flex items-center gap-2 group"
-            >
-              <span className="hidden sm:inline">Analyze New</span>
-              <UploadCloud size={16} className="text-blue-400 group-hover:text-blue-300" />
-            </button>
-          )}
-        </div>
-      </header>
+          
+          <div className="flex items-center gap-3">
+            {parsedData && (
+              <button 
+                onClick={() => { setParsedData(null); setActiveHistoryId(null); setIsDefanged(true); }} 
+                className="bg-slate-800 hover:bg-slate-700 text-slate-200 px-4 py-2 rounded-md text-sm font-semibold transition-all border border-slate-700 hover:border-slate-500 shadow-sm flex items-center gap-2 group"
+              >
+                <span className="hidden sm:inline">Analyze New</span>
+                <UploadCloud size={16} className="text-blue-400 group-hover:text-blue-300" />
+              </button>
+            )}
+          </div>
+        </header>
 
-      {/* Scrollable Dashboard Area */}
+        {/* Dashboard */}
         <main className="flex-1 overflow-y-auto p-4 md:p-8 custom-scrollbar relative z-10">
           <div className="max-w-6xl mx-auto space-y-6">
 
@@ -665,10 +1120,59 @@ export default function App() {
               </div>
             )}
 
-            {/* Analysis Dashboard */}
+            {/* Dashboard */}
             {parsedData && (
               <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 animate-in fade-in slide-in-from-bottom-8 duration-500">
                 
+                {/* THREAT INTELLIGENCE — full-width banner row */}
+                {intel && (
+                  <div className="lg:col-span-2">
+                    <SectionCard 
+                      title="Threat Intelligence" 
+                      icon={Crosshair}
+                      className="border-rose-900/40 bg-gradient-to-br from-slate-800/60 to-rose-950/10"
+                    >
+                      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                        {/* Score */}
+                        <div className="lg:col-span-1 bg-slate-900/60 p-5 rounded-lg border border-slate-700/60 shadow-inner">
+                          <div className="flex items-center gap-2 mb-3">
+                            <Activity size={14} className="text-rose-400" />
+                            <h4 className="text-[11px] font-bold text-slate-400 uppercase tracking-wider">Threat Score</h4>
+                          </div>
+                          <ThreatScore score={intel.threat.score} factors={intel.threat.factors} />
+                        </div>
+
+                        {/* MITRE Techniques */}
+                        <div className="lg:col-span-2">
+                          <div className="flex items-center justify-between mb-3">
+                            <div className="flex items-center gap-2">
+                              <Zap size={14} className="text-amber-400" />
+                              <h4 className="text-[11px] font-bold text-slate-400 uppercase tracking-wider">
+                                MITRE ATT&CK Mapping ({intel.techniques.length})
+                              </h4>
+                            </div>
+                            <a href="https://attack.mitre.org/" target="_blank" rel="noreferrer" className="text-[10px] text-slate-500 hover:text-blue-400 transition-colors flex items-center gap-1">
+                              attack.mitre.org <ExternalLink size={9}/>
+                            </a>
+                          </div>
+                          {intel.techniques.length === 0 ? (
+                            <div className="bg-emerald-950/20 border border-emerald-900/40 rounded-lg p-6 text-center">
+                              <ShieldCheck className="mx-auto text-emerald-500 mb-2" size={32} />
+                              <p className="text-sm text-emerald-300 font-semibold">No ATT&CK techniques triggered</p>
+                              <p className="text-[11px] text-slate-400 mt-1">Heuristic detection found no clear adversary patterns in this email.</p>
+                            </div>
+                          ) : (
+                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                              {intel.techniques.map(t => <MitreCard key={t.id} technique={t} />)}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    </SectionCard>
+                  </div>
+                )}
+
+                {/* Routing & Metadata */}
                 <SectionCard title="Routing & Metadata" icon={Server}>
                   <div className="space-y-3">
                     <div className="grid grid-cols-[100px_1fr] gap-x-2 gap-y-3 items-center">
@@ -690,7 +1194,6 @@ export default function App() {
                       <span className="text-slate-500 font-bold text-[11px] uppercase tracking-wider">To</span>
                       <span className="truncate bg-slate-900/80 px-2 py-1 rounded border border-slate-700/50 text-slate-200">{parsedData.basic.to}</span>
                       
-                      {}
                       {parsedData.basic.cc !== 'Unknown' && (
                         <>
                           <span className="text-slate-500 font-bold text-[11px] uppercase tracking-wider">CC</span>
@@ -724,7 +1227,6 @@ export default function App() {
                       <span className="text-slate-500 font-bold text-[11px] uppercase tracking-wider">X-Mailer</span>
                       <span className="truncate text-slate-400">{parsedData.network.xMailer}</span>
                       
-                      {}
                       <span className="text-slate-500 font-bold text-[11px] uppercase tracking-wider">Priority</span>
                       <span className={`truncate ${parsedData.basic.priority.toLowerCase().includes('high') || parsedData.basic.priority.includes('1') ? 'text-rose-400 font-bold' : 'text-slate-400'}`}>
                         {parsedData.basic.priority}
@@ -733,7 +1235,6 @@ export default function App() {
                       <span className="text-slate-500 font-bold text-[11px] uppercase tracking-wider">Content-Type</span>
                       <span className="truncate text-slate-400 text-xs font-mono">{parsedData.basic.contentType}</span>
 
-                      {}
                       <span className="text-slate-500 font-bold text-[11px] uppercase tracking-wider self-start mt-1">Routing Hops</span>
                       <div className="space-y-1.5 mt-1">
                         <div className="text-slate-400 text-[11px] mb-2">{parsedData.network.hopCount} server(s) recorded in transit:</div>
@@ -851,7 +1352,6 @@ export default function App() {
                     <div className="absolute top-0 right-0 w-64 h-64 bg-blue-500/5 rounded-full blur-3xl -z-10 pointer-events-none"></div>
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-x-8 gap-y-6">
                       
-                      {/* PHASE 1 HEADER */}
                       <div className="col-span-1 md:col-span-2 mt-2 mb-1 border-b border-slate-700/50 pb-2">
                         <h4 className="text-sm font-bold text-slate-300 uppercase tracking-wider flex items-center gap-2">
                           <Mail size={16} className="text-blue-400"/> Phase 1: Header & Routing Analysis
@@ -883,9 +1383,7 @@ export default function App() {
 
                         <div className="bg-slate-900/60 p-3.5 rounded-lg border border-slate-700/60 shadow-sm relative">
                           <span className="absolute -top-2.5 left-3 bg-slate-800 px-2 text-[10px] font-bold text-blue-400 uppercase tracking-wide border border-slate-700 rounded-sm">5. Date & Time (UTC)</span>
-                          <div className="flex justify-between items-center mt-1">
-                            <div className="text-sm text-slate-200 font-mono truncate">{parsedData.basic.utcDate !== 'Unknown' ? parsedData.basic.utcDate : parsedData.basic.date}</div>
-                          </div>
+                          <div className="text-sm text-slate-200 font-mono truncate mt-1">{parsedData.basic.utcDate !== 'Unknown' ? parsedData.basic.utcDate : parsedData.basic.date}</div>
                         </div>
 
                         <div className="bg-slate-900/60 p-3.5 rounded-lg border border-slate-700/60 shadow-sm relative">
@@ -894,7 +1392,6 @@ export default function App() {
                         </div>
                       </div>
 
-                      {/* PHASE 2 HEADER */}
                       <div className="col-span-1 md:col-span-2 mt-4 mb-1 border-b border-slate-700/50 pb-2">
                         <h4 className="text-sm font-bold text-slate-300 uppercase tracking-wider flex items-center gap-2">
                           <Server size={16} className="text-rose-400"/> Phase 2: Infrastructure & Payload Analysis
@@ -907,22 +1404,19 @@ export default function App() {
                           <div className="text-sm text-rose-300 font-mono font-bold truncate mt-1">{parsedData.network.originatingIp}</div>
                         </div>
                         
-                        <div className="bg-blue-900/20 p-4 rounded-lg border border-blue-800/50 shadow-inner group transition-all focus-within:bg-blue-900/30 focus-within:border-blue-500/50 relative mt-2">
-                          <div className="flex justify-between items-center mb-2.5">
-                            <span className="absolute -top-2.5 left-3 bg-blue-900 px-2 text-[10px] font-bold text-blue-200 uppercase tracking-wide border border-blue-700 rounded-sm">8. Resolved Host</span>
-                            <div></div> {/* Spacer */}
-                            {parsedData.network.originatingIp !== 'Unknown' && (
-                              <a href={`https://whois.domaintools.com/${parsedData.network.originatingIp}`} target="_blank" rel="noreferrer" className="text-[10px] bg-blue-600 hover:bg-blue-500 text-white px-2 py-1 rounded shadow-sm flex items-center gap-1 transition-colors">
-                                <ExternalLink size={10} /> DomainTools
-                              </a>
-                            )}
-                          </div>
+                        <div className="bg-blue-900/20 p-4 rounded-lg border border-blue-800/50 shadow-inner transition-all focus-within:bg-blue-900/30 focus-within:border-blue-500/50 relative mt-2">
+                          <span className="absolute -top-2.5 left-3 bg-blue-900 px-2 text-[10px] font-bold text-blue-200 uppercase tracking-wide border border-blue-700 rounded-sm">8. Resolved Host</span>
+                          {parsedData.network.originatingIp !== 'Unknown' && (
+                            <a href={`https://whois.domaintools.com/${parsedData.network.originatingIp}`} target="_blank" rel="noreferrer" className="absolute top-2 right-2 text-[10px] bg-blue-600 hover:bg-blue-500 text-white px-2 py-1 rounded shadow-sm flex items-center gap-1 transition-colors">
+                              <ExternalLink size={10} /> DomainTools
+                            </a>
+                          )}
                           <input 
                             type="text" 
                             value={ctfAnswers.reverseDns}
                             onChange={(e) => updateCtf('reverseDns', e.target.value)}
                             placeholder="Analyst Input Required..." 
-                            className="w-full bg-slate-950/50 border border-slate-700/80 rounded p-2.5 text-sm text-white focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-all font-mono" 
+                            className="w-full bg-slate-950/50 border border-slate-700/80 rounded p-2.5 text-sm text-white focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-all font-mono mt-1" 
                           />
                         </div>
 
@@ -974,7 +1468,6 @@ export default function App() {
                         </div>
                       </div>
 
-                      {/* PHASE 3 HEADER */}
                       <div className="col-span-1 md:col-span-2 mt-4 mb-1 border-b border-slate-700/50 pb-2">
                         <h4 className="text-sm font-bold text-slate-300 uppercase tracking-wider flex items-center gap-2">
                           <ShieldCheck size={16} className="text-emerald-400"/> Phase 3: Analyst Assessment
@@ -1016,6 +1509,77 @@ export default function App() {
                   </SectionCard>
                 </div>
 
+                {/* HUNT QUERIES & IOC EXPORT — full width */}
+                {intel && (
+                  <div className="lg:col-span-2">
+                    <SectionCard 
+                      title="Hunt Queries & IOC Export" 
+                      icon={Database}
+                      className="border-indigo-900/40"
+                      action={
+                        <button 
+                          onClick={() => downloadFile(currentExport, exportFilename, iocTab === 'stix' ? 'application/json' : 'text/plain')}
+                          className="flex items-center gap-2 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold px-3 py-1.5 rounded shadow-lg transition-colors"
+                        >
+                          <Download size={14} /> Download
+                        </button>
+                      }
+                    >
+                      <div className="text-xs text-slate-400 mb-3 leading-relaxed">
+                        Pre-built hunt queries derived from the extracted IOCs. KQL targets Microsoft 365 Defender / Sentinel Advanced Hunting; SPL targets Splunk with O365 / Sysmon sourcetypes. Schema substitutions for other SIEMs are documented inline at the top of each query block.
+                      </div>
+                      
+                      <div className="flex flex-wrap gap-1.5 mb-4 border-b border-slate-700/60 pb-3">
+                        {[
+                          { id: 'kql', label: 'KQL (Defender / Sentinel)', icon: Database },
+                          { id: 'spl', label: 'SPL (Splunk)', icon: Database },
+                          { id: 'csv', label: 'CSV (IOC Table)', icon: FileText },
+                          { id: 'stix', label: 'STIX 2.1 Bundle', icon: FileJson }
+                        ].map(t => {
+                          const TabIcon = t.icon;
+                          return (
+                            <button 
+                              key={t.id}
+                              onClick={() => setIocTab(t.id)}
+                              className={`px-3 py-1.5 text-xs font-bold rounded-md transition-all flex items-center gap-1.5 ${iocTab === t.id ? 'bg-indigo-600 text-white shadow-md' : 'bg-slate-800 text-slate-400 hover:bg-slate-700 hover:text-slate-200'}`}
+                            >
+                              <TabIcon size={12} /> {t.label}
+                            </button>
+                          );
+                        })}
+                      </div>
+
+                      <div className="bg-[#0d1117] rounded-lg border border-slate-700/80 overflow-hidden shadow-inner relative">
+                        <div className="absolute top-2 right-2 z-10">
+                          <CopyButton text={currentExport} />
+                        </div>
+                        <pre className="p-4 pt-3 pr-20 overflow-auto h-[400px] custom-scrollbar terminal-scrollbar text-[12px] leading-relaxed text-slate-300 font-mono whitespace-pre-wrap break-words selection:bg-indigo-900/50">
+                          {currentExport}
+                        </pre>
+                      </div>
+
+                      <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mt-4">
+                        <div className="bg-slate-900/60 border border-slate-700/60 p-2.5 rounded text-center">
+                          <div className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">IPs</div>
+                          <div className="text-lg font-bold text-blue-400">{parsedData.network.originatingIp !== 'Unknown' ? 1 : 0}</div>
+                        </div>
+                        <div className="bg-slate-900/60 border border-slate-700/60 p-2.5 rounded text-center">
+                          <div className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">Domains</div>
+                          <div className="text-lg font-bold text-indigo-400">{parsedData.payload.domains.length}</div>
+                        </div>
+                        <div className="bg-slate-900/60 border border-slate-700/60 p-2.5 rounded text-center">
+                          <div className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">URLs</div>
+                          <div className="text-lg font-bold text-rose-400">{parsedData.payload.urls.length}</div>
+                        </div>
+                        <div className="bg-slate-900/60 border border-slate-700/60 p-2.5 rounded text-center">
+                          <div className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">Files</div>
+                          <div className="text-lg font-bold text-orange-400">{parsedData.payload.attachments.length}</div>
+                        </div>
+                      </div>
+                    </SectionCard>
+                  </div>
+                )}
+
                 {/* Email Body Preview */}
                 <div className="lg:col-span-2">
                   <SectionCard title="Sandboxed Email Body Preview" icon={Mail}>
@@ -1054,7 +1618,7 @@ export default function App() {
                   </SectionCard>
                 </div>
 
-                {/* Raw Source Code */}
+                {/* Raw Source */}
                 <div className="lg:col-span-2">
                   <div className="bg-slate-900/80 border border-slate-700/60 rounded-xl overflow-hidden shadow-xl">
                     <div className="border-b border-slate-700/60 bg-slate-800/80 flex items-center justify-between">
